@@ -378,6 +378,18 @@ const SUMMARY_HEADINGS: readonly string[] = [
   "#### Failures",
 ];
 
+/*
+ * The workflow-command layer runs the hostile engine as a real child process
+ * through the Action's spawn chain, and the engine here is a shebang script:
+ * on Windows the Action resolves `stellar-canary.exe`, and a JavaScript file
+ * under that name is not a valid Win32 executable. Issue #436 tracks the
+ * Node-copy engine that will supply `.exe` support; until then this layer is
+ * skipped there for the same reason `tests/integration/end-to-end.test.ts` is.
+ * The Markdown layer is pure string rendering and still runs on all three
+ * platforms, so the escaping assertions are not lost on Windows.
+ */
+const SKIP_WORKFLOW_LAYER = process.platform === "win32";
+
 const WORKFLOW_CASES = CASES.filter((testCase) => testCase.layer === "workflow-command");
 const MARKDOWN_CASES = CASES.filter((testCase) => testCase.layer === "markdown");
 const ENFORCED_WORKFLOW_CASES = WORKFLOW_CASES.filter((testCase) => testCase.status === "enforced");
@@ -420,7 +432,7 @@ describe("hostile report strings (data file)", () => {
   });
 });
 
-describe("workflow-command layer (real @actions/core)", () => {
+describe.skipIf(SKIP_WORKFLOW_LAYER)("workflow-command layer (real @actions/core)", () => {
   afterEach(() => {
     for (const key of HERMETIC_ENV_KEYS) {
       delete process.env[key];
