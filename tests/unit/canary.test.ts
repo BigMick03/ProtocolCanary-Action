@@ -20,6 +20,10 @@ const cacheMocks = vi.hoisted(() => ({
   saveCacheMock: vi.fn(),
 }));
 
+const toolCacheMocks = vi.hoisted(() => ({
+  findMock: vi.fn(),
+}));
+
 const coreMocks = vi.hoisted(() => ({
   infoMock: vi.fn(),
   debugMock: vi.fn(),
@@ -48,6 +52,10 @@ vi.mock("@actions/cache", () => ({
   isFeatureAvailable: cacheMocks.isFeatureAvailableMock,
   restoreCache: cacheMocks.restoreCacheMock,
   saveCache: cacheMocks.saveCacheMock,
+}));
+
+vi.mock("@actions/tool-cache", () => ({
+  find: toolCacheMocks.findMock,
 }));
 
 vi.mock("@actions/core", () => ({
@@ -372,6 +380,7 @@ describe("ensureCanaryInstalled", () => {
     cacheMocks.isFeatureAvailableMock.mockReset().mockReturnValue(false);
     cacheMocks.restoreCacheMock.mockReset().mockResolvedValue(undefined);
     cacheMocks.saveCacheMock.mockReset().mockResolvedValue(undefined);
+    toolCacheMocks.findMock.mockReset().mockReturnValue("");
     // No test in this file depends on the runner's real home directory:
     // anything reaching the homedir fallback without overriding the mock
     // sees a sentinel that must not leak into a CARGO_HOME-based path.
