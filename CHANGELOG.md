@@ -107,6 +107,19 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- Oversized job summaries are truncated deterministically instead of being
+  rejected. GitHub refuses a step-summary append above its payload limit
+  (HTTP 413), which lost the *whole* summary — including the pass/fail
+  verdict — on a run with hundreds of failures. The generated Markdown is
+  now bounded strictly under 1,000,000 UTF-8 bytes, keeping the title,
+  protocol/project/network identity, per-surface table, overall verdict and
+  counts, and then the failures, warnings and skipped-fixture list in that
+  priority order. Detail is dropped whole, so the cut never lands mid-line,
+  mid-entry, or between a `<details>` and its `</details>`; each clipped
+  section reports how many entries it lost, and the summary ends with a
+  warning pointing at the unaffected report artifact. A summary that already
+  fits is published byte-for-byte unchanged, and truncation is measured in
+  UTF-8 bytes rather than characters ([#334]).
 - Each invocation writes its Execution Receipt to its own file under `RUNNER_TEMP`
   (#493). The path was always `stellar-canary-receipt.json`, so a second Action step in the
   same job overwrote the first step's receipt and its `receipt-path` output then pointed at

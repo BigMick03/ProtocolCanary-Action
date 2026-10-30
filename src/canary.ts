@@ -6,6 +6,7 @@ import * as https from "node:https";
 import type { ClientRequest, IncomingMessage } from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as toolCache from "@actions/tool-cache";
 
 import {
   consumeResponse,
@@ -75,6 +76,120 @@ function ensureInstallRoot(): string {
 
 function binaryName(): string {
   return process.platform === "win32" ? "stellar-canary.exe" : "stellar-canary";
+}
+
+function cargoBinDir(): string {
+  const cargoHome = process.env.CARGO_HOME ?? path.join(os.homedir(), ".cargo");
+  return path.join(cargoHome, "bin");
+}
+
+function isTrustedExecutable(binaryPath: string): boolean {
+  if (!path.isAbsolute(binaryPath)) {
+    return false;
+  }
+
+  try {
+    const binary = fs.lstatSync(binaryPath);
+    const directory = fs.lstatSync(path.dirname(binaryPath));
+    if (!binary.isFile() || binary.isSymbolicLink() || !directory.isDirectory() || directory.isSymbolicLink()) {
+      return false;
+    }
+
+    if (process.platform !== "win32") {
+      const uid = process.getuid?.();
+      const trustedOwner = (owner: number): boolean => owner === 0 || (uid !== undefined && owner === uid);
+      if (
+        uid === undefined ||
+        !trustedOwner(binary.uid) ||
+        !trustedOwner(directory.uid) ||
+        (binary.mode & 0o111) === 0 ||
+        (binary.mode & 0o7022) !== 0 ||
+        (directory.mode & 0o022) !== 0
+      ) {
+        return false;
+      }
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findInPath(): string[] {
+  const candidates: string[] = [];
+  const configuredPath = process.env.PATH ?? "";
+  if (configuredPath === "") {
+    return candidates;
+  }
+
+  for (const section of configuredPath.split(path.delimiter)) {
+    if (section === "" || !path.isAbsolute(section)) {
+      core.warning(`Ignoring invalid PATH entry ${JSON.stringify(section)} while searching for stellar-canary.`);
+      continue;
+    }
+
+    const candidate = path.join(section, binaryName());
+    if (fs.existsSync(candidate)) {
+      candidates.push(candidate);
+    }
+  }
+  return candidates;
+}
+
+function findInToolCache(version: string): string[] {
+  if ((process.env.RUNNER_TOOL_CACHE ?? "").trim() === "") {
+    return [];
+  }
+
+  try {
+    const installDir = toolCache.find("stellar-canary", version, process.arch);
+    if (installDir === "") {
+      return [];
+    }
+    return [path.join(installDir, binaryName()), path.join(installDir, "bin", binaryName())].filter((candidate) =>
+      fs.existsSync(candidate),
+    );
+  } catch (error) {
+    core.debug(`Could not search the tool cache for stellar-canary ${version}: ${String(error)}`);
+    return [];
+  }
+}
+
+async function expectedPublishedBinaryChecksum(
+  binaryPath: string,
+  resolved: ResolvedVersion,
+  token?: string,
+): Promise<string | undefined> {
+  const checksums = await lookupPublishedChecksums(resolved.version, token);
+  if (checksums === undefined) {
+    core.warning(
+      `Refusing to execute the pre-installed stellar-canary at ${binaryPath}: no published checksum is available.`,
+    );
+    return undefined;
+  }
+
+  const expected = selectExpectedChecksum(checksums, binaryName());
+  if (expected === undefined) {
+    core.warning(
+      `Refusing to execute the pre-installed stellar-canary at ${binaryPath}: ` +
+        "the published checksum manifest has no matching binary entry.",
+    );
+  }
+  return expected;
+}
+
+async function matchesPublishedChecksum(binaryPath: string, expected: string): Promise<boolean> {
+  try {
+    const actual = await sha256File(binaryPath);
+    if (actual === expected) {
+      return true;
+    }
+    core.warning(`Ignoring pre-installed stellar-canary at ${binaryPath}: its published checksum does not match.`);
+  } catch (error) {
+    core.warning(`Ignoring pre-installed stellar-canary at ${binaryPath}: could not verify its checksum (${String(error)}).`);
+  }
+  return false;
 }
 
 /**
@@ -775,6 +890,47 @@ function cacheKeyFor(resolved: ResolvedVersion): string {
  * not match, or the restore throws. Caching is a pure optimization, so a
  * failure here is never surfaced as an error.
  */
+async function findExisting(
+  resolved: ResolvedVersion,
+  token?: string,
+  env?: ChildProcessEnvironment,
+): Promise<InstalledCanary | undefined> {
+  const childEnv = env ?? buildChildEnvironment(process.env, process.platform).env;
+  const candidates = [
+    path.join(cargoBinDir(), binaryName()),
+    ...findInToolCache(resolved.version),
+    ...findInPath(),
+  ].filter((candidate, index, all) => fs.existsSync(candidate) && all.indexOf(candidate) === index);
+
+  let expectedChecksum: string | undefined;
+  let checksumLookedUp = false;
+  for (const candidatePath of candidates) {
+    if (!isTrustedExecutable(candidatePath)) {
+      core.warning(`Ignoring untrusted stellar-canary candidate at ${candidatePath}.`);
+      continue;
+    }
+
+    if (!checksumLookedUp) {
+      expectedChecksum = await expectedPublishedBinaryChecksum(candidatePath, resolved, token);
+      checksumLookedUp = true;
+    }
+    if (expectedChecksum === undefined || !(await matchesPublishedChecksum(candidatePath, expectedChecksum))) {
+      continue;
+    }
+
+    const version = await getInstalledVersion(candidatePath, VERSION_PROBE_TIMEOUT_MS, [], childEnv);
+    if (version === resolved.version) {
+      core.info(`Found checksum-verified stellar-canary ${version} at ${candidatePath}.`);
+      return { binaryPath: candidatePath, version };
+    }
+    core.warning(
+      `Ignoring pre-installed stellar-canary at ${candidatePath}: it reports version ${String(version)}, ` +
+        `but ${resolved.version} was requested.`,
+    );
+  }
+  return undefined;
+}
+
 async function restoreFromCache(
   resolved: ResolvedVersion,
   env: ChildProcessEnvironment,
@@ -1516,11 +1672,12 @@ export async function ensureCanaryInstalled(
     core.warning(compatibility.warning);
   }
 
-  // A child environment is always provided, so `cargo` (and the binaries it
-  // runs while building dependency scripts) never inherits the job's
-  // secrets. Callers pass the environment built from
-  // `engine-env-passthrough`; the default allow-list is the fallback.
   const childEnv = env ?? buildChildEnvironment(process.env, process.platform).env;
+
+  const preInstalled = await findExisting(resolved, token, childEnv);
+  if (preInstalled !== undefined) {
+    return preInstalled;
+  }
 
   const root = ensureInstallRoot();
   const existingPath = installedBinaryPath(root);

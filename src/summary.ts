@@ -21,7 +21,23 @@ const OVERALL_LABEL: Readonly<Record<OverallStatus, string>> = {
   error: "🚫 **ERROR**",
 };
 
-/** Human-readable labels for CF-01 skip reason codes. */
+export const SUMMARY_BYTE_LIMIT = 1_000_000;
+
+export const TRUNCATION_NOTICE =
+  "> [!WARNING] Summary truncated due to GitHub Step Summary size limits; view full report artifact for details.";
+
+function byteLength(text: string): number {
+  return Buffer.byteLength(text, "utf8");
+}
+
+function joinedByteLength(lines: readonly string[]): number {
+  let total = 0;
+  for (const line of lines) {
+    total += byteLength(line) + 1;
+  }
+  return Math.max(0, total - 1);
+}
+
 const SKIP_CODE_LABELS: Readonly<Record<string, string>> = {
   UNSUPPORTED_PROTOCOL: "Unsupported protocol",
   SURFACE_DISABLED: "Surface disabled",
@@ -31,7 +47,6 @@ const SKIP_CODE_LABELS: Readonly<Record<string, string>> = {
   UNKNOWN: "Unknown reason",
 };
 
-/** Render order for skip groups; unknown/unrecorded codes always come last. */
 const SKIP_CODE_ORDER: readonly string[] = [
   "UNSUPPORTED_PROTOCOL",
   "SURFACE_DISABLED",
@@ -41,12 +56,6 @@ const SKIP_CODE_ORDER: readonly string[] = [
   "UNKNOWN",
 ];
 
-/**
- * Reads a skip reason code per CF-01: an absent or unrecognized code is
- * `UNKNOWN`, never the raw value and never an empty string. This mirrors the
- * engine's own `SkipCode::parse` fallback so the summary groups reports from
- * older and newer engines the same way.
- */
 function normalizeSkipCode(code: unknown): string {
   return typeof code === "string" && Object.prototype.hasOwnProperty.call(SKIP_CODE_LABELS, code)
     ? code
@@ -58,57 +67,41 @@ function skipCodeRank(code: string): number {
   return index === -1 ? SKIP_CODE_ORDER.length : index;
 }
 
-/**
- * Renders skipped fixtures as one table grouped by stable reason code
- * (#341). Rows are sorted by code rank, then fixture id and surface, so
- * repeated runs over the same report produce identical Markdown. Every
- * engine-supplied value is escaped; missing values get explicit fallbacks
- * rather than throwing or rendering an empty cell.
- */
-function skippedFixtureLines(skipped: readonly CanarySkip[]): string[] {
-  const rows = skipped.map((skip) => {
-    const fixtureId =
-      typeof skip.fixtureId === "string" && skip.fixtureId.trim() !== ""
-        ? skip.fixtureId.trim()
-        : "(unknown fixture)";
-    const surface =
-      typeof skip.surface === "string" && skip.surface.trim() !== ""
-        ? skip.surface.trim()
-        : "(unknown surface)";
-    const reason =
-      typeof skip.reason === "string" && skip.reason.trim() !== ""
-        ? skip.reason.trim()
-        : "(no reason recorded)";
-    return { code: normalizeSkipCode(skip.code), fixtureId, surface, reason };
-  });
-  rows.sort((a, b) => {
-    const byCode = skipCodeRank(a.code) - skipCodeRank(b.code);
-    if (byCode !== 0) return byCode;
-    if (a.fixtureId !== b.fixtureId) return a.fixtureId < b.fixtureId ? -1 : 1;
-    if (a.surface !== b.surface) return a.surface < b.surface ? -1 : 1;
-    return 0;
-  });
-
-  return [
-    "<details><summary>Skipped fixtures</summary>",
-    "",
-    "| Reason code | Fixture | Surface | Reason |",
-    "|---|---|---|---|",
-    ...rows.map(
-      (row) =>
-        `| ${codeSpan(row.code)} — ${escapeInline(SKIP_CODE_LABELS[row.code] ?? "Unknown reason")} | ` +
-        `${codeSpan(row.fixtureId)} | ${escapeInline(row.surface)} | ${escapeInline(row.reason)} |`,
-    ),
-    "",
-    "</details>",
-    "",
-  ];
+function skippedFixtureRow(skip: CanarySkip): string {
+  const fixtureId =
+    typeof skip.fixtureId === "string" && skip.fixtureId.trim() !== ""
+      ? skip.fixtureId.trim()
+      : "(unknown fixture)";
+  const surface =
+    typeof skip.surface === "string" && skip.surface.trim() !== ""
+      ? skip.surface.trim()
+      : "(unknown surface)";
+  const reason =
+    typeof skip.reason === "string" && skip.reason.trim() !== ""
+      ? skip.reason.trim()
+      : "(no reason recorded)";
+  const code = normalizeSkipCode(skip.code);
+  return (
+    `| ${codeSpan(code)} — ${escapeInline(SKIP_CODE_LABELS[code] ?? "Unknown reason")} | ` +
+    `${codeSpan(fixtureId)} | ${escapeInline(surface)} | ${escapeInline(reason)} |`
+  );
 }
 
-/** Aggregates one surface's results into its summary table row. Returns
- * `undefined` when no results match the surface, which is how
- * `renderSummaryMarkdown` omits untouched surfaces (e.g. an offline run has
- * no rpc/soroban rows) instead of fabricating a pass. */
+export interface ArtifactSummaryInfo {
+  readonly id?: number | undefined;
+  readonly name?: string | undefined;
+}
+
+export function buildArtifactUrl(artifactId: number): string {
+  const serverUrl = (process.env.GITHUB_SERVER_URL || "https://github.com").replace(/\/+$/, "");
+  const repo = process.env.GITHUB_REPOSITORY;
+  const runId = process.env.GITHUB_RUN_ID;
+  if (repo && runId) {
+    return `${serverUrl}/${repo}/actions/runs/${runId}/artifacts/${String(artifactId)}`;
+  }
+  return `${serverUrl}/actions/runs/artifacts/${String(artifactId)}`;
+}
+
 function surfaceRowLabel(results: CanaryReport["results"], surface: Surface): string | undefined {
   const forSurface = results.filter((r) => r.surface === surface);
   if (forSurface.length === 0) {
@@ -124,7 +117,7 @@ function surfaceRowLabel(results: CanaryReport["results"], surface: Surface): st
   return `| ${SURFACE_HEADINGS[surface]} | ${icon} (${String(passCount)}/${String(forSurface.length)}) |`;
 }
 
-function notablyList(report: CanaryReport, statuses: readonly ("fail" | "error" | "warning")[]): string[] {
+function notablyEntries(report: CanaryReport, statuses: readonly ("fail" | "error" | "warning")[]): string[][] {
   return report.results
     .filter((r) => (statuses as readonly string[]).includes(r.status))
     .map((r) => {
@@ -132,51 +125,30 @@ function notablyList(report: CanaryReport, statuses: readonly ("fail" | "error" 
       if (r.details !== undefined && r.details.trim() !== "") {
         lines.push(fencedBlock(r.details.trim()));
       }
-      return lines.join("\n");
+      return lines;
     });
 }
 
-export interface ArtifactSummaryInfo {
-  readonly id?: number | undefined;
-  readonly name?: string | undefined;
-}
-
-/**
- * Builds the GitHub Actions artifact web URL for a given artifact ID.
- * Resolves repository and workflow run ID from environment variables when present.
- */
-export function buildArtifactUrl(artifactId: number): string {
-  const serverUrl = (process.env.GITHUB_SERVER_URL || "https://github.com").replace(/\/+$/, "");
-  const repo = process.env.GITHUB_REPOSITORY;
-  const runId = process.env.GITHUB_RUN_ID;
-  if (repo && runId) {
-    return `${serverUrl}/${repo}/actions/runs/${runId}/artifacts/${String(artifactId)}`;
+export function protocolMismatchMessage(report: CanaryReport): string | undefined {
+  const observed = report.network?.observedProtocol;
+  const target = report.targetProtocol;
+  if (typeof observed !== "number" || !Number.isInteger(observed) || observed <= 0) {
+    return undefined;
   }
-  return `${serverUrl}/actions/runs/artifacts/${String(artifactId)}`;
+  if (!Number.isInteger(target) || target <= 0 || observed === target) {
+    return undefined;
+  }
+  return (
+    `Protocol mismatch: the network reported protocol ${String(observed)}, ` +
+    `but this run targets protocol ${String(target)}.`
+  );
 }
 
-/**
- * Provenance metadata for the "Provenance & Trust" summary section
- * (issue #373). Every field is optional because the upstream pipelines
- * that produce them are only partially landed on `main`: the binary digest
- * comes from the published-checksum verification in `src/canary.ts`, while
- * the fixture-pack digest depends on the unmerged download pipeline (#338)
- * and the receipt data on #360. Missing fields are rendered as explicitly
- * unverified rather than omitted or fabricated.
- */
 export interface SummaryProvenance {
-  /** SHA-256 of the Canary binary as observed for this run (issue #373).
-   * Undefined when the binary could not be read. */
   readonly binarySha256?: string | undefined;
-  /** SHA-256 digest of the canonical fixture pack, once #338's download
-   * verification produces one. */
   readonly packDigest?: string | undefined;
-  /** Engine version the run executed. */
   readonly engineVersion?: string | undefined;
-  /** Argument array the engine was invoked with (issue #416). When present,
-   * the summary renders a collapsed "Reproduction command" section. */
   readonly engineArgs?: readonly string[] | undefined;
-  /** Code describing a report write persistence failure (issue #508). */
   readonly reportWriteError?: string | undefined;
 }
 
@@ -185,14 +157,6 @@ const UNVERIFIED_BINARY_ROW =
 const UNVERIFIED_PACK_ROW =
   "| Fixture pack | (unverified — fixture-pack download pipeline not implemented, see #338) |";
 
-/** Renders the "Provenance & Trust" section (issue #373). The wording is
- * deliberately constrained by decision D-07: a published checksum verifies
- * *data integrity* — it detects corruption or substitution of the artifact
- * between release and runner — and is expressly not proof of the release
- * author's identity or endorsement, because Protocol-Canary publishes no
- * signatures. D-11 keeps the same honesty on the transport side: no redirect
- * is followed during lookup today, so a digest reported here was fetched (or
- * refused) over a single authenticated HTTPS request. */
 function provenanceLines(provenance: SummaryProvenance): string[] {
   const binaryRow =
     provenance.binarySha256 !== undefined
@@ -220,40 +184,58 @@ function provenanceLines(provenance: SummaryProvenance): string[] {
   ];
 }
 
-/**
- * Explains an observed-protocol mismatch (#430): the engine checked the
- * target protocol, but the network reported a different protocol version
- * during live checks. Returns `undefined` when there is nothing to warn
- * about — no network, no usable observed protocol, or agreement — so callers
- * never emit a warning for a report that could not observe a protocol at
- * all. The message is shared by the job summary and the annotation so both
- * surfaces say exactly the same thing.
- */
-export function protocolMismatchMessage(report: CanaryReport): string | undefined {
-  const observed = report.network?.observedProtocol;
-  const target = report.targetProtocol;
-  if (typeof observed !== "number" || !Number.isInteger(observed) || observed <= 0) {
-    return undefined;
-  }
-  if (!Number.isInteger(target) || target <= 0 || observed === target) {
-    return undefined;
-  }
-  return (
-    `Protocol mismatch: the network reported protocol ${String(observed)}, ` +
-    `but this run targets protocol ${String(target)}.`
-  );
+interface SummarySection {
+  readonly heading: readonly string[];
+  readonly entries: readonly (readonly string[])[];
+  readonly trailer: readonly string[];
+  readonly noun: string;
 }
 
-/** Pure Markdown rendering, kept separate from `core.summary` so it can be
- * golden/snapshot-tested without a GitHub Actions runtime. `provenance`
- * renders the Provenance & Trust section (issue #373) and the reproduction
- * command (issue #416); omitting it renders no section, keeping every
- * pre-provenance consumer's output identical. */
-export function renderSummaryMarkdown(
+function summarySections(report: CanaryReport): SummarySection[] {
+  const skipped = [...(report.skipped ?? [])].sort((a, b) => {
+    const byCode = skipCodeRank(normalizeSkipCode(a.code)) - skipCodeRank(normalizeSkipCode(b.code));
+    if (byCode !== 0) return byCode;
+    const aId = typeof a.fixtureId === "string" ? a.fixtureId : "";
+    const bId = typeof b.fixtureId === "string" ? b.fixtureId : "";
+    if (aId !== bId) return aId < bId ? -1 : 1;
+    const aSurf = typeof a.surface === "string" ? a.surface : "";
+    const bSurf = typeof b.surface === "string" ? b.surface : "";
+    if (aSurf !== bSurf) return aSurf < bSurf ? -1 : 1;
+    return 0;
+  });
+  const skippedRows = skipped.map((s) => skippedFixtureRow(s));
+  return [
+    {
+      heading: ["#### Failures", ""],
+      entries: notablyEntries(report, ["fail", "error"]),
+      trailer: [""],
+      noun: "failing checks",
+    },
+    {
+      heading: ["#### Warnings", ""],
+      entries: notablyEntries(report, ["warning"]),
+      trailer: [""],
+      noun: "warnings",
+    },
+    {
+      heading: [
+        "<details><summary>Skipped fixtures</summary>",
+        "",
+        "| Reason code | Fixture | Surface | Reason |",
+        "|---|---|---|---|",
+      ],
+      entries: skippedRows.map((row) => [row]),
+      trailer: ["", "</details>", ""],
+      noun: "skipped fixtures",
+    },
+  ];
+}
+
+function summaryPreamble(
   report: CanaryReport,
   provenance?: SummaryProvenance,
   artifact?: ArtifactSummaryInfo,
-): string {
+): string[] {
   const lines: string[] = [];
   lines.push("## Stellar Protocol Canary", "");
   lines.push(`Protocol: ${escapeInline(String(report.targetProtocol))}`);
@@ -265,9 +247,6 @@ export function renderSummaryMarkdown(
         : "";
     lines.push(`Network: ${escapeInline(report.network.name)}${observed}`);
   }
-  // A live-check network that reports a different protocol than the target
-  // (#430) is worth surfacing prominently: the checks still describe the
-  // target protocol, not what the network is currently running.
   const mismatch = protocolMismatchMessage(report);
   if (mismatch !== undefined) {
     lines.push(`> ⚠️ ${mismatch}`, "");
@@ -283,19 +262,17 @@ export function renderSummaryMarkdown(
     (row): row is string => row !== undefined,
   );
   if (rows.length > 0) {
-    lines.push("| Surface | Result |", "|---|---|", ...rows, "");
+    lines.push("| Surface | Result |", "|---|---|");
+    for (const row of rows) {
+      lines.push(row);
+    }
+    lines.push("");
   }
 
   lines.push("### Result", "", OVERALL_LABEL[report.status], "");
   lines.push(`${String(report.counts.passed)}/${String(report.counts.total)} applicable checks passed.`, "");
-
   const replayed = countReplayed(report);
   if (replayed > 0) {
-    // Footnote for cache reuse (issue #350): how many results were replayed
-    // from the engine's result cache instead of executed in this run, so a
-    // reader can tell execution from cache reuse at a glance. Reports
-    // without any replayed results (all pre-cache engine releases) render
-    // nothing here.
     const total = report.counts.total;
     const percent = total > 0 ? Math.round((replayed / total) * 100) : 0;
     lines.push(
@@ -311,41 +288,135 @@ export function renderSummaryMarkdown(
     );
   }
 
-  const failures = notablyList(report, ["fail", "error"]);
-
   if (provenance !== undefined) {
-    lines.push(...provenanceLines(provenance));
-  }
-  if (failures.length > 0) {
-    lines.push("#### Failures", "", ...failures, "");
-  }
-
-  const warnings = notablyList(report, ["warning"]);
-  if (warnings.length > 0) {
-    lines.push("#### Warnings", "", ...warnings, "");
+    for (const line of provenanceLines(provenance)) {
+      lines.push(line);
+    }
   }
 
-  if (report.skipped !== undefined && report.skipped.length > 0) {
-    lines.push(...skippedFixtureLines(report.skipped));
-  }
-
-  // Reproduction command section (issue #416)
   if (provenance?.engineArgs !== undefined && provenance.engineArgs.length > 0) {
     lines.push(renderReproductionCommand(provenance.engineArgs, provenance.engineVersion));
   }
-
-  return lines.join("\n");
+  return lines;
 }
 
-/**
- * Renders a collapsed <details> section with the engine version and a
- * copy-pasteable `stellar-canary check` command.
- *
- * Arguments are quoted for POSIX shell safety. The --rpc-url value is
- * masked when it contains userinfo, a query string, or a fragment, using
- * the same parsing as src/redact.ts.
- */
-function renderReproductionCommand(args: readonly string[], engineVersion?: string): string {
+function omittedMarker(count: number, noun: string): string {
+  return `- _… ${String(count)} more ${noun} omitted; see the full report artifact._`;
+}
+
+function clipToLimit(lines: readonly string[], limit: number): string {
+  const kept: string[] = [];
+  let bytes = 0;
+  for (const line of lines) {
+    const cost = byteLength(line) + (kept.length === 0 ? 0 : 1);
+    if (bytes + cost > limit) {
+      break;
+    }
+    kept.push(line);
+    bytes += cost;
+  }
+  return kept.join("\n");
+}
+
+function renderTruncatedSummary(
+  report: CanaryReport,
+  provenance?: SummaryProvenance,
+  artifact?: ArtifactSummaryInfo,
+): string {
+  const body: string[] = [];
+  let bodyBytes = 0;
+  const push = (lines: readonly string[]): void => {
+    for (const line of lines) {
+      bodyBytes += byteLength(line) + (body.length === 0 ? 0 : 1);
+      body.push(line);
+    }
+  };
+  const pushCost = (lines: readonly string[]): number => {
+    if (lines.length === 0 || body.length === 0) {
+      return joinedByteLength(lines);
+    }
+    return joinedByteLength(lines) + 1;
+  };
+
+  let reserved = 0;
+  const noticeCost = byteLength(TRUNCATION_NOTICE) + 1;
+  const fits = (lines: readonly string[]): boolean =>
+    pushCost(lines) + reserved + noticeCost + bodyBytes < SUMMARY_BYTE_LIMIT;
+
+  push(summaryPreamble(report, provenance, artifact));
+
+  if (bodyBytes + noticeCost >= SUMMARY_BYTE_LIMIT) {
+    const roomForBody = SUMMARY_BYTE_LIMIT - byteLength(TRUNCATION_NOTICE) - 2;
+    const clipped = clipToLimit(body, roomForBody);
+    return clipped === "" ? TRUNCATION_NOTICE : `${clipped}\n${TRUNCATION_NOTICE}`;
+  }
+
+  for (const section of summarySections(report)) {
+    const first = section.entries[0];
+    if (section.entries.length === 0 || first === undefined) {
+      continue;
+    }
+    const worstCaseMarker = omittedMarker(section.entries.length, section.noun);
+    if (!fits([...section.heading, ...first, worstCaseMarker, ...section.trailer])) {
+      if (fits([...section.heading, worstCaseMarker, ...section.trailer])) {
+        push(section.heading);
+        push([worstCaseMarker]);
+        push(section.trailer);
+      }
+      continue;
+    }
+
+    push(section.heading);
+    reserved = pushCost([worstCaseMarker, ...section.trailer]);
+    let kept = 0;
+    for (const entry of section.entries) {
+      if (!fits(entry)) {
+        break;
+      }
+      push(entry);
+      kept += 1;
+    }
+    reserved = 0;
+    const dropped = section.entries.length - kept;
+    if (dropped > 0) {
+      push([omittedMarker(dropped, section.noun)]);
+    }
+    push(section.trailer);
+  }
+
+  push([TRUNCATION_NOTICE]);
+  return body.join("\n");
+}
+
+export function renderSummaryMarkdown(
+  report: CanaryReport,
+  provenance?: SummaryProvenance,
+  artifact?: ArtifactSummaryInfo,
+): string {
+  const lines: string[] = [];
+  const add = (values: readonly string[]): void => {
+    for (const value of values) {
+      lines.push(value);
+    }
+  };
+
+  add(summaryPreamble(report, provenance, artifact));
+  for (const section of summarySections(report)) {
+    if (section.entries.length === 0) {
+      continue;
+    }
+    add(section.heading);
+    for (const entry of section.entries) {
+      add(entry);
+    }
+    add(section.trailer);
+  }
+
+  const markdown = lines.join("\n");
+  return byteLength(markdown) < SUMMARY_BYTE_LIMIT ? markdown : renderTruncatedSummary(report, provenance, artifact);
+}
+
+export function renderReproductionCommand(args: readonly string[], engineVersion?: string): string {
   const lines: string[] = [];
   lines.push("<details><summary>Reproduction command</summary>", "");
 
@@ -353,19 +424,12 @@ function renderReproductionCommand(args: readonly string[], engineVersion?: stri
     lines.push(`Engine version: ${codeSpan(engineVersion)}`, "");
   }
 
-  // Build the command string with POSIX shell quoting
   const command = buildCommandString(args);
   lines.push(fencedBlock(command), "", "</details>", "");
 
   return lines.join("\n");
 }
 
-/**
- * Builds a POSIX-shell-safe command string from the argument array.
- *
- * Masks the --rpc-url value when it contains userinfo, query string, or fragment.
- * Quotes arguments that contain spaces, quotes, or shell metacharacters.
- */
 function buildCommandString(args: readonly string[]): string {
   const parts: string[] = ["stellar-canary"];
 
@@ -374,10 +438,9 @@ function buildCommandString(args: readonly string[]): string {
     const arg = args[i]!; // i < args.length guaranteed by loop condition
     const nextArg = args[i + 1];
 
-    // Mask --rpc-url value if it contains credentials, query, or fragment
     if (arg === "--rpc-url" && nextArg !== undefined) {
       parts.push(arg, maskRpcUrl(nextArg));
-      i += 2; // Skip the next argument since we handled it
+      i += 2;
       continue;
     }
 
@@ -388,44 +451,15 @@ function buildCommandString(args: readonly string[]): string {
   return parts.join(" ");
 }
 
-/**
- * Longest fenced code block the summary may embed, used to pick a fence
- * length that is strictly longer than any run of backticks the embedded
- * text itself contains. A fence is only closed by an equally long run at
- * line start, so a run inside the content can never close a longer fence.
- */
 const MAX_EMBEDDED_FENCE_LENGTH = 20;
 
-/**
- * Markdown rendering of an execution failure — the "Canary could not run
- * at all" case, distinct from a compatibility failure the report describes.
- *
- * Reasons and diagnostic blocks each retain at most 40 tail lines plus
- * the truncation notice, within 8 KiB UTF-8 including that notice (#499).
- * Markdown scaffolding is outside this content budget.
- *
- * The sanitized diagnostic is embedded inside a fenced code block, but it is
- * raw text from an external process (stderr, a timeout notice), so it may
- * itself contain ``` (e.g. a compiler/panic message quoting a code block).
- * A fixed fence would be closed early by that sequence, and the rest of the
- * diagnostic would render as broken markdown. The fence is therefore made
- * longer than the longest backtick run the diagnostic contains — the exact
- * strategy CommonMark §Fenced code blocks specifies for embedding such
- * content.
- */
 export function renderExecutionFailureMarkdown(
   reason: string,
   diagnostic: string,
   artifact?: ArtifactSummaryInfo,
 ): string {
   const trimmed = formatSafeDiagnosticTail(diagnostic).trim();
-  // Longest run of backticks anywhere in the diagnostic, in characters.
-  // Also covers the closing fence the diagnostic text may already contain,
-  // because a closing fence of length n is itself a run of n backticks.
   const longestRun = (trimmed.match(/`+/g) ?? []).reduce((max, run) => Math.max(max, run.length), 0);
-  // A fence shorter than the diagnostic's longest run could be closed early
-  // by that run; one strictly longer cannot. 20 backticks of headroom also
-  // gives nested embedding (a summary quoted inside another code block) room.
   const fenceLength = Math.max(3, longestRun + 1, MAX_EMBEDDED_FENCE_LENGTH);
   const fence = "`".repeat(fenceLength);
   const lines = [
@@ -447,16 +481,6 @@ export function renderExecutionFailureMarkdown(
   return lines.join("\n");
 }
 
-/**
- * Publishes `markdown` to the current GitHub Actions job summary.
- *
- * This wraps `core.summary.addRaw(markdown, true).write()`. If adding or
- * writing the summary fails, it throws {@link SummaryPublishFailedError}
- * with the underlying error message.
- *
- * @param markdown Markdown to append to the job summary.
- * @throws {SummaryPublishFailedError} When summary publication fails.
- */
 export async function writeSummary(markdown: string): Promise<void> {
   try {
     await core.summary.addRaw(markdown, true).write();

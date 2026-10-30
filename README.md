@@ -295,6 +295,14 @@ The summary is rendered by `renderSummaryMarkdown` in
 [`src/summary.ts`](src/summary.ts). A passing run over three surfaces, with a
 network configured and one fixture skipped:
 
+The rendered Markdown is bounded to 1,000,000 UTF-8 bytes (the GitHub Step
+Summary limit). When a report would exceed that, the summary keeps the
+verdict, top-level metrics, regression counts, high-priority failures and
+errors, critical preamble (provenance, protocol mismatch, report-write
+warning, reproduction command), and trims lower-priority entries with
+omitted-count markers; the full report remains available via the uploaded
+artifact. Multibyte UTF-8 characters are never split.
+
 ```markdown
 ## Stellar Protocol Canary
 
